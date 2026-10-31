@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TFVB LSB-Export</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --fg: #1d1d1b; --muted: #6b6b66; --card: #ffffff;
+    --border: #dcdcd6; --accent: #1f6feb; --accent-fg: #ffffff;
+    --row-alt: #f1f1ed; --total-bg: #e8eefc; --error: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --fg: #ececea; --muted: #9a9a94; --card: #1f1f1e;
+      --border: #3a3a37; --accent: #4c8dff; --accent-fg: #0b0b0b;
+      --row-alt: #252524; --total-bg: #1e2a44; --error: #ff7b72;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1400px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 24px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  #drop {
+    border: 2px dashed var(--border); border-radius: 10px; padding: 28px 16px;
+    text-align: center; cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  #drop.over { border-color: var(--accent); background: var(--row-alt); }
+  #drop strong { color: var(--accent); }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 14px; }
+  label { color: var(--muted); }
+  input[type=number] {
+    width: 6.5em; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--fg); font: inherit;
+  }
+  button {
+    padding: 7px 14px; border-radius: 6px; border: 1px solid var(--accent);
+    background: var(--accent); color: var(--accent-fg); font: inherit; cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { color: var(--muted); }
+  #status.error { color: var(--error); }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  th, td { border: 1px solid var(--border); padding: 4px 8px; text-align: right; }
+  th { background: var(--row-alt); font-weight: 600; text-align: center; }
+  td:first-child, th:first-child { text-align: left; position: sticky; left: 0; background: var(--card); }
+  thead th:first-child { background: var(--row-alt); }
+  tbody tr:nth-child(even) td { background: var(--row-alt); }
+  tr.total td { background: var(--total-bg) !important; font-weight: 600; }
+  td.zero { color: var(--muted); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>TFVB LSB-Export</h1>
+  <p class="lead">Mitglieder-Export (Tab-getrennte CSV) hochladen und Mitgliederzahlen nach Verein, Altersklasse und Geschlecht erhalten.
+    Die Datei wird nur lokal im Browser verarbeitet und nirgendwohin hochgeladen.</p>
+
+  <div class="card">
+    <div id="drop" tabindex="0" role="button" aria-label="CSV-Datei auswählen">
+      CSV-Datei hierher ziehen oder <strong>klicken zum Auswählen</strong>
+      <div id="filename" style="color:var(--muted);margin-top:6px"></div>
+    </div>
+    <input type="file" id="file" accept=".csv,.tsv,.txt,text/csv,text/plain" hidden>
+    <div class="controls">
+      <label for="year">Stichjahr</label>
+      <input type="number" id="year" min="1900" max="2999">
+      <button id="copy" disabled>In Zwischenablage kopieren</button>
+      <button id="download" class="secondary" disabled>Als TSV herunterladen</button>
+      <span id="status"></span>
+    </div>
+  </div>
+
+  <div class="card" id="result" hidden>
+    <div class="table-wrap"><table id="table"></table></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+// Gender index: 0 = M, 1 = W, 2 = D (same order as the Rust enum).
+const BRACKETS = [
+  { label: "bis 6",    max: 6 },
+  { label: "7–14",     max: 14 },
+  { label: "15–18",    max: 18 },
+  { label: "19–20",    max: 20 },
+  { label: "21–26",    max: 26 },
+  { label: "27–40",    max: 40 },
+  { label: "41–50",    max: 50 },
+  { label: "51–60",    max: 60 },
+  { label: "über 60",  max: Infinity },
+];
+
+// Strips the Excel-style ="..." (or plain "...") wrapper around a field
+// and unescapes doubled quotes ("" -> ").
+function declutter(field) {
+  field = field.trim();
+  const inner = field.startsWith("=") ? field.slice(1) : field;
+  if (inner.length >= 2 && inner.startsWith('"') && inner.endsWith('"')) {
+    return inner.slice(1, -1).replace(/""/g, '"');
+  }
+  return field;
+}
+
+function parsePlayer(line) {
+  const parts = line.replace(/\r$/, "").split("\t").map(declutter);
+  if (parts.length < 11) return null;
+
+  const gender = parts[4] === "M" ? 0 : parts[4] === "W" ? 1 : 2;
+  const club = parts[6];
+  const yearStr = parts[10];
+  if (!/^\+?\d+$/.test(yearStr)) return null;
+  const year = Number(yearStr);
+  if (year > 0xFFFFFFFF) return null;
+
+  return { first: parts[1], last: parts[0], gender, club, year };
+}
+
+function newClub() {
+  // [total, ...brackets], each [M, W, D]
+  return Array.from({ length: 1 + BRACKETS.length }, () => [0, 0, 0]);
+}
+
+function addPlayer(club, player, refYear) {
+  const age = refYear - player.year;
+  club[0][player.gender]++;
+  // Negative age (birth year in the future) ends up in the last bracket,
+  // like the wrapped-around u32 in the release build of the Rust tool.
+  let idx = BRACKETS.findIndex(b => age >= 0 && age <= b.max);
+  if (idx < 0) idx = BRACKETS.length - 1;
+  club[1 + idx][player.gender]++;
+}
+
+function buildReport(text, refYear) {
+  const players = [], skipped = [];
+  text.split("\n").forEach((line, i) => {
+    if (!line.includes("\t")) return;
+    const p = parsePlayer(line);
+    if (p) players.push(p);
+    else if (i > 1) skipped.push(line.split("\t").slice(0, 2).map(declutter).reverse().join(" ") + ` (Zeile ${i + 1})`);
+  });
+  const clubs = new Map();
+  const total = newClub();
+  for (const p of players) {
+    if (!clubs.has(p.club)) clubs.set(p.club, newClub());
+    addPlayer(clubs.get(p.club), p, refYear);
+    addPlayer(total, p, refYear);
+  }
+  const names = [...clubs.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const rows = names.map(name => ({ name, counts: clubs.get(name) }));
+  rows.push({ name: "Gesamtmitglieder", counts: total, isTotal: true });
+
+  // Same format as the Rust tool's stdout (including trailing tab).
+  const tsv = rows.map(r => {
+    const sum = r.counts[0][0] + r.counts[0][1] + r.counts[0][2];
+    return r.name + "\t" + sum + "\t" + r.counts.map(c => c.join("\t") + "\t").join("") ;
+  }).join("\n") + "\n";
+
+  return { players: players.length, skipped, rows, tsv };
+}
+
+function decode(buffer) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  } catch {
+    // Excel exports on Windows are often not UTF-8.
+    return new TextDecoder("windows-1252").decode(buffer);
+  }
+}
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+const fileInput = $("file"), drop = $("drop"), yearInput = $("year");
+const statusEl = $("status"), table = $("table"), result = $("result");
+const copyBtn = $("copy"), dlBtn = $("download");
+
+yearInput.value = new Date().getUTCFullYear();
+let currentText = null, currentReport = null, currentName = "";
+
+function setStatus(msg, isError) {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle("error", !!isError);
+}
+
+function render() {
+  if (currentText == null) return;
+  const refYear = parseInt(yearInput.value, 10);
+  if (!Number.isFinite(refYear)) { setStatus("Ungültiges Stichjahr.", true); return; }
+  currentReport = buildReport(currentText, refYear);
+
+  const head1 = ["<tr><th rowspan=2>Verein</th><th rowspan=2>Gesamt</th><th colspan=3>Alle</th>"]
+    .concat(BRACKETS.map(b => `<th colspan=3>${b.label}</th>`)).join("") + "</tr>";
+  const head2 = "<tr>" + "<th>M</th><th>W</th><th>D</th>".repeat(1 + BRACKETS.length) + "</tr>";
+  const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const cell = n => `<td${n === 0 ? ' class="zero"' : ""}>${n}</td>`;
+  const body = currentReport.rows.map(r => {
+    const sum = r.counts[0][0] + r.counts[0][1] + r.counts[0][2];
+    return `<tr${r.isTotal ? ' class="total"' : ""}><td>${esc(r.name) || "<em>(ohne Verein)</em>"}</td>${cell(sum)}`
+      + r.counts.flat().map(cell).join("") + "</tr>";
+  }).join("");
+  table.innerHTML = `<thead>${head1}${head2}</thead><tbody>${body}</tbody>`;
+  result.hidden = false;
+  copyBtn.disabled = dlBtn.disabled = false;
+
+  const nClubs = currentReport.rows.length - 1;
+  if (currentReport.players === 0) {
+    setStatus("Keine gültigen Zeilen gefunden (erwartet: mind. 11 Tab-getrennte Spalten, Geburtsjahr in Spalte 11).", true);
+  } else {
+    const sk = currentReport.skipped;
+    setStatus(`${currentReport.players} Mitglieder in ${nClubs} Vereinen.`
+      + (sk.length ? ` ${sk.length} Zeile(n) ohne Geburtsjahr übersprungen: ${sk.join(", ")}` : ""), sk.length > 0);
+  }
+}
+
+async function loadFile(file) {
+  if (!file) return;
+  currentName = file.name;
+  $("filename").textContent = file.name;
+  currentText = decode(await file.arrayBuffer());
+  render();
+}
+
+drop.addEventListener("click", () => fileInput.click());
+drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); } });
+fileInput.addEventListener("change", () => loadFile(fileInput.files[0]));
+["dragenter", "dragover"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", e => loadFile(e.dataTransfer.files[0]));
+yearInput.addEventListener("input", render);
+
+copyBtn.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(currentReport.tsv);
+    setStatus("In die Zwischenablage kopiert – kann direkt in Excel eingefügt werden.");
+  } catch {
+    setStatus("Kopieren fehlgeschlagen – bitte „Als TSV herunterladen“ verwenden.", true);
+  }
+});
+
+dlBtn.addEventListener("click", () => {
+  const blob = new Blob([currentReport.tsv], { type: "text/tab-separated-values;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (currentName.replace(/\.[^.]*$/, "") || "lsb-export") + "-auswertung.tsv";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+</script>
+</body>
+</html>
